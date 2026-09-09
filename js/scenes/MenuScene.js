@@ -20,7 +20,12 @@ class MenuScene extends Phaser.Scene {
       const bg = this.add.rectangle(0, 0, cw, ch, 0x101c2b).setStrokeStyle(2, 0x2c4258);
       const name = this.add.text(0, -ch / 2 + 30, d.name, TS(24, '#dff3ff', { fontStyle: 'bold' })).setOrigin(0.5);
       const stars = this.add.text(0, -ch / 2 + 62, d.stars, TS(17, '#ffd24a')).setOrigin(0.5);
-      const desc = this.add.text(0, -ch / 2 + 84, d.desc, TS(13, '#7d93a8', { wordWrap: { width: cw - 44 }, align: 'center' })).setOrigin(0.5, 0);
+      // 说明文字：useAdvancedWrap 按字符断行（基础换行只在空格处断行，中文会溢出）
+      const desc = this.add.text(0, -ch / 2 + 84, d.desc, TS(13, '#7d93a8', {
+        wordWrap: { width: cw - 44, useAdvancedWrap: true },
+        align: 'center',
+        lineSpacing: 4,
+      })).setOrigin(0.5, 0);
       const b = best[d.key] || 0;
       const bestT = this.add.text(0, ch / 2 - 54, `历史最高：${b}`, TS(14, b > 0 ? '#ffd24a' : '#4a6076')).setOrigin(0.5);
       const go = this.add.text(0, ch / 2 - 24, '▶ 点击启航', TS(15, '#7fe3ff')).setOrigin(0.5);
