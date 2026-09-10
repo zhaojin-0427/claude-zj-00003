@@ -981,15 +981,18 @@ class GameScene extends Phaser.Scene {
       const n = randInt(cfg.unloadCount[0], cfg.unloadCount[1]);
       for (let i = 0; i < n; i++) ship.cargo.push(this.makeContainer());
     } else if (this.contractMode && !this.intro) {
-      // 合同模式：70% 概率发往在执行合同的目的地，订单直接对应合同货物组合
-      const active = this.contracts.filter(c => c.status === 'active' && c.deadline > this.state.time);
+      // 合同模式：70% 概率发往在执行合同的目的地，订单只包含合同“剩余需求”
+      const active = this.contracts.filter(c =>
+        c.status === 'active' && c.deadline > this.state.time &&
+        CARGO_KEYS.some(k => c.req[k] - c.done[k] > 0));
       let ctr = null;
       if (active.length && Math.random() < 0.7) ctr = pick(active);
       const baseName = pick(SHIP_NAMES);
       if (ctr) {
+        const remaining = this.contractRemaining(ctr);
         ship.dest = ctr.dest;
         ship.contractId = ctr.id;
-        ship.requires = { ...ctr.req };
+        ship.requires = remaining;
         ship.name = `${baseName} → ${ctr.dest}`;
       } else {
         ship.dest = pick(DESTINATIONS);
@@ -1433,56 +1436,102 @@ class GameScene extends Phaser.Scene {
       return;
     }
 
-    // 按当前行情计算货物收益
-    let baseAtBase = 0, atMarket = 0;
-    CARGO_KEYS.forEach(k => {
-      const n = Math.min(ship.loaded[k], ship.requires[k] || 0);
-      baseAtBase += n * MARKET.base[k];
-      atMarket += n * this.market.prices[k];
-    });
-
+    // 合同匹配：
+    //  1) 造船时即指派给合同（contractId）的，按该合同剩余需求结算；
+    //  2) 散单仅当目的地相同且订单货物恰好等于合同“剩余需求”时，才计入合同；
+    //     其余一律按散单（×1、不计合同进度、不计合同结算合计）。
     let ctr = null;
-    if (ship.contractId != null) ctr = this.contracts.find(c => c.id === ship.contractId && c.status === 'active');
-    // 目的地匹配的在执行合同同样可结算（即使该船不是为合同生成的）
-    if (!ctr && ship.dest) ctr = this.contracts.find(c => c.status === 'active' && c.dest === ship.dest);
+    if (ship.contractId != null) ctr = this.contracts.find(c => c.id === ship.contractId && c.status === 'active') || null;
+    if (!ctr && ship.dest) {
+      const match = this.contracts.find(c =>
+        c.status === 'active' && c.dest === ship.dest && this.orderMatchesContract(ship, c));
+      if (match) ctr = match;
+    }
 
-    const mult = ctr ? ctr.mult : 1;
-    const marketBonus = Math.round((atMarket - baseAtBase) * mult);
-    const baseEarn = Math.round(baseAtBase * mult);
+    // 本船货物计入合同的数量（不得超过合同剩余需求），其余按散单计价
+    const intoContract = { ore: 0, energy: 0, supply: 0 };
+    if (ctr) CARGO_KEYS.forEach(k => { intoContract[k] = Math.min(ship.loaded[k], ctr.req[k] - ctr.done[k]); });
+
+    let ctrBaseRaw = 0, ctrMarketRaw = 0, freeBaseRaw = 0, freeMarketRaw = 0;
+    CARGO_KEYS.forEach(k => {
+      const nCtr = intoContract[k];
+      const nFree = ship.loaded[k] - nCtr;
+      ctrBaseRaw += nCtr * MARKET.base[k];
+      ctrMarketRaw += nCtr * this.market.prices[k];
+      freeBaseRaw += nFree * MARKET.base[k];
+      freeMarketRaw += nFree * this.market.prices[k];
+    });
     const timeBonus = Math.max(0, Math.ceil(ship.timeLeft));
-    const gain = baseEarn + marketBonus + timeBonus;
+    const totalLoaded = CARGO_KEYS.reduce((s, k) => s + ship.loaded[k], 0);
+    const ctrUnits = CARGO_KEYS.reduce((s, k) => s + intoContract[k], 0);
+    const ctrTime = ctr ? Math.round(timeBonus * ctrUnits / totalLoaded) : 0;
+    const freeTime = timeBonus - ctrTime;
 
-    st.score += gain;
-    st.fuel = Math.min(FUEL_MAX, st.fuel + 8);
-    st.stability = Math.min(100, st.stability + 4);
-    this.stats.done++;
-    this.earnings.base += baseEarn;
-    this.earnings.market += marketBonus;
-    this.earnings.time += timeBonus;
-    this.earnings.fuel += 8;
+    let gain = 0, ctrBaseEarn = 0, ctrMarketEarn = 0;
+    let freeBaseEarn = 0, freeMarketEarn = 0;
 
     if (ctr) {
-      CARGO_KEYS.forEach(k => { ctr.done[k] += Math.min(ship.loaded[k], ship.requires[k] || 0); });
-      ctr.baseEarn += baseEarn; ctr.marketEarn += marketBonus; ctr.timeEarn += timeBonus;
-      this.addLog(
-        `✅ 合同[${ctr.id}] ${ship.dest} 交货 +${gain}（基础${baseEarn} 行情${marketBonus >= 0 ? '+' : ''}${marketBonus} 时间+${timeBonus}）+8燃料`,
-        '#9dff9d');
-      this.floatText(fx, fy, '+' + gain, '#c79fff');
+      const mult = ctr.mult;
+      ctrBaseEarn = Math.round(ctrBaseRaw * mult);
+      ctrMarketEarn = Math.round((ctrMarketRaw - ctrBaseRaw) * mult);
+      CARGO_KEYS.forEach(k => { ctr.done[k] += intoContract[k]; });
+      ctr.baseEarn += ctrBaseEarn; ctr.marketEarn += ctrMarketEarn; ctr.timeEarn += ctrTime;
+      // 合同收益三段计入“合同结算合计”
+      this.earnings.base += ctrBaseEarn;
+      this.earnings.market += ctrMarketEarn;
+      this.earnings.time += ctrTime;
+      gain += ctrBaseEarn + ctrMarketEarn + ctrTime;
+
       const complete = CARGO_KEYS.every(k => ctr.done[k] >= ctr.req[k]);
       if (complete) {
         ctr.status = 'done';
         this.stats.contractDone++;
         this.addLog(`🏁 合同 [${ctr.id}] 前往${ctr.dest}已全部完成！`, '#ffd24a');
       }
-    } else {
+    }
+    // 散单部分：×1 基准、行情补差、剩余时间奖励，不计入合同结算合计
+    freeBaseEarn = Math.round(freeBaseRaw);
+    freeMarketEarn = Math.round(freeMarketRaw - freeBaseRaw);
+    gain += freeBaseEarn + freeMarketEarn + freeTime;
+
+    st.score += gain;
+    st.fuel = Math.min(FUEL_MAX, st.fuel + 8);
+    st.stability = Math.min(100, st.stability + 4);
+    this.stats.done++;
+    this.earnings.fuel += 8;
+
+    if (ctr) {
+      const ctrGain = ctrBaseEarn + ctrMarketEarn + ctrTime;
       this.addLog(
-        `✅ 前往${ship.dest || '未知'}散单 +${gain}（基础${baseEarn} 行情${marketBonus >= 0 ? '+' : ''}${marketBonus} 时间+${timeBonus}）+8燃料`,
+        `✅ 合同[${ctr.id}] ${ship.dest} 交货 +${ctrGain}` +
+        `（基础${ctrBaseEarn} 行情${ctrMarketEarn >= 0 ? '+' : ''}${ctrMarketEarn} 时间+${ctrTime}）+8燃料`,
         '#9dff9d');
-      this.floatText(fx, fy, '+' + gain, '#ffd24a');
+      this.floatText(fx, fy, '+' + gain, '#c79fff');
+    }
+    const freeUnits = totalLoaded - ctrUnits;
+    if (freeUnits > 0 || !ctr) {
+      const freeGain = freeBaseEarn + freeMarketEarn + freeTime;
+      this.addLog(`📦 散单${ship.dest ? '→' + ship.dest : ''} +${freeGain}（基础${freeBaseEarn} 行情${freeMarketEarn >= 0 ? '+' : ''}${freeMarketEarn}，不计合同）+8燃料`, '#9fb7cc');
+      if (!ctr) this.floatText(fx, fy, '+' + gain, '#ffd24a');
     }
     Sfx.success();
     this.saveRun();
     if (ctr) this.checkAllContractsResolved();
+  }
+
+  // 合同剩余需求
+  contractRemaining(ctr) {
+    const rem = {};
+    CARGO_KEYS.forEach(k => { rem[k] = Math.max(0, ctr.req[k] - ctr.done[k]); });
+    return rem;
+  }
+
+  // 散单是否恰好对应某合同的剩余需求（目的地相同且每种货物数量一致）
+  orderMatchesContract(ship, ctr) {
+    const rem = this.contractRemaining(ctr);
+    const remTotal = CARGO_KEYS.reduce((s, k) => s + rem[k], 0);
+    if (remTotal <= 0) return false;
+    return CARGO_KEYS.every(k => (ship.requires[k] || 0) === rem[k]);
   }
 
   checkAllContractsResolved() {
@@ -1524,7 +1573,7 @@ class GameScene extends Phaser.Scene {
       `行情加成：${this.earnings.market >= 0 ? '+' : ''}${this.earnings.market}`,
       `时间奖励：${this.earnings.time}`,
       `合同结算合计：${total}`,
-      `其他得分（卸货等）：${Math.max(0, st.score - total)}`,
+      `其他得分（散单 / 卸货等）：${Math.max(0, st.score - total)}`,
       `最终总分：${st.score}`,
       `完成 ${this.stats.contractDone} 份 · 逾期 ${this.stats.contractExpired} 份 · 用时 ${fmtTime(st.time)}`,
       `历史最佳合同收益：${Math.max(prev, total)}`,
