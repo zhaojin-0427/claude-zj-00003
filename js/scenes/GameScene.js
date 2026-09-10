@@ -31,7 +31,7 @@ class GameScene extends Phaser.Scene {
     this.selected = null;              // {kind:'bay'|'shipCargo'|'shipLoad', key, id}
     this.containerSeq = 1;
     this.shipSeq = 1;
-    this.stats = { done: 0, missed: 0, stolen: 0 };
+    this.stats = { done: 0, unloaded: 0, missed: 0, stolen: 0 };
     this.spawnTimer = 1.0;
     this.eventTimer = rand(this.cfg.eventInterval[0], this.cfg.eventInterval[1]);
     this.lastEvent = null;
@@ -159,18 +159,19 @@ class GameScene extends Phaser.Scene {
     this.queueList = this.add.container(x + 10, 88);
 
     this.add.text(x, 260, '航线统计', TS(12, '#7d93a8'));
-    this.add.rectangle(x, 280, w, 122, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
+    this.add.rectangle(x, 280, w, 144, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
     const best = loadBest()[this.cfg.key] || 0;
     this.statsTexts = {
-      done:   this.add.text(x + 12, 290, '', TS(12, '#9fb7cc')),
-      missed: this.add.text(x + 12, 312, '', TS(12, '#9fb7cc')),
-      stolen: this.add.text(x + 12, 334, '', TS(12, '#9fb7cc')),
-      time:   this.add.text(x + 12, 356, '', TS(12, '#9fb7cc')),
-      best:   this.add.text(x + 12, 378, `历史最高：${best}`, TS(12, '#ffd24a')),
+      done:     this.add.text(x + 12, 290, '', TS(12, '#9fb7cc')),
+      unloaded: this.add.text(x + 12, 312, '', TS(12, '#9fb7cc')),
+      missed:   this.add.text(x + 12, 334, '', TS(12, '#9fb7cc')),
+      stolen:   this.add.text(x + 12, 356, '', TS(12, '#9fb7cc')),
+      time:     this.add.text(x + 12, 378, '', TS(12, '#9fb7cc')),
+      best:     this.add.text(x + 12, 400, `历史最高：${best}`, TS(12, '#ffd24a')),
     };
 
-    this.add.text(x, 418, '操作指南', TS(12, '#7d93a8'));
-    this.add.rectangle(x, 438, w, 254, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
+    this.add.text(x, 440, '操作指南', TS(12, '#7d93a8'));
+    this.add.rectangle(x, 460, w, 232, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
     const help = [
       '· 点击货物 → 选择 / 再点取消',
       '· 点击舱位 → 放入选中货物',
@@ -185,7 +186,7 @@ class GameScene extends Phaser.Scene {
       '完成装货订单赚取分数与燃料，',
       '稳定度归零则空间站瘫痪！',
     ].join('\n');
-    this.add.text(x + 12, 448, help, TS(11, '#7d93a8', { lineSpacing: 6 }));
+    this.add.text(x + 12, 470, help, TS(11, '#7d93a8', { lineSpacing: 5 }));
   }
 
   buildBanner() {
@@ -336,6 +337,7 @@ class GameScene extends Phaser.Scene {
 
     // 统计
     setTxt(this.statsTexts.done, `完成订单：${this.stats.done}`);
+    setTxt(this.statsTexts.unloaded, `卸货完成：${this.stats.unloaded}`);
     setTxt(this.statsTexts.missed, `错失船只：${this.stats.missed}`);
     setTxt(this.statsTexts.stolen, `被掠货物：${this.stats.stolen}`);
     setTxt(this.statsTexts.time, `存活时间：${fmtTime(st.time)}`);
@@ -656,8 +658,15 @@ class GameScene extends Phaser.Scene {
     const c = this.findContainer(sel);
     if (!c) { this.clearSelection(); return; }
     const need = ship.requires[c.type] || 0;
-    if (ship.loaded[c.type] >= need) {
+    const remaining = need - ship.loaded[c.type];
+    if (remaining <= 0) {
       this.addLog(`${truncate(ship.name, 10)} 不需要更多${CARGO_TYPES[c.type].name}`, '#ff8a80');
+      Sfx.error();
+      return;
+    }
+    // 整箱超过剩余需求时拒收，提示先拆分，避免超出部分被浪费
+    if (c.units > remaining) {
+      this.addLog(`只需 ${remaining} 件${CARGO_TYPES[c.type].name}，整箱超出需求 — 请先拆分`, '#ff8a80');
       Sfx.error();
       return;
     }
@@ -870,7 +879,7 @@ class GameScene extends Phaser.Scene {
       if (left === 0) {
         st.score += 15;
         st.fuel = Math.min(FUEL_MAX, st.fuel + 4);
-        this.stats.done++;
+        this.stats.unloaded++;
         this.addLog(`✅ ${truncate(ship.name, 12)} 卸货完毕离港 +15 分 +4 燃料`, '#9dff9d');
         this.floatText(fx, fy, '+15', '#7fe3ff');
         Sfx.success();
@@ -903,10 +912,10 @@ class GameScene extends Phaser.Scene {
         this.floatText(fx, fy, '+' + gain, '#ffd24a');
         Sfx.success();
       } else if (fulfilled > 0) {
-        st.score += value;
+        // 订单未完成不发放分数，仅扣稳定度
         st.stability = Math.max(0, st.stability - 5);
         this.stats.missed++;
-        this.addLog(`⚠ 订单未完成（${fulfilled}/${reqTotal}）离港 +${value} 分，稳定度 -5`, '#ffb74d');
+        this.addLog(`⚠ 订单未完成（${fulfilled}/${reqTotal}）离港，稳定度 -5`, '#ffb74d');
         Sfx.error();
       } else {
         st.stability = Math.max(0, st.stability - 8);
@@ -1056,6 +1065,7 @@ class GameScene extends Phaser.Scene {
       `最终得分：${st.score}`,
       `历史最高：${Math.max(prev, st.score)}`,
       `完成订单：${this.stats.done}`,
+      `卸货完成：${this.stats.unloaded}`,
       `错失船只：${this.stats.missed}`,
       `被掠货物：${this.stats.stolen}`,
       `存活时间：${fmtTime(st.time)}`,
