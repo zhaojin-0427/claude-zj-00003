@@ -11,12 +11,18 @@ class GameScene extends Phaser.Scene {
 
   init(data) {
     this.diffIndex = (data && data.difficulty != null) ? data.difficulty : 0;
+    this.contractMode = !!(data && data.mode === 'contract');
+    this.resumeKey = (data && data.resume) ? this.cfgKeyOf(data.difficulty) : null;
+    this.freshContract = !!(data && data.fresh);
   }
+
+  cfgKeyOf(idx) { return DIFFICULTIES[idx != null ? idx : this.diffIndex].key; }
 
   /* ================= 初始化 ================= */
 
   create() {
     this.cfg = DIFFICULTIES[this.diffIndex];
+    if (this.contractMode && this.freshContract) clearContractRun(this.cfg.key);
     const st = this.state = {
       time: 0, score: 0,
       fuel: this.cfg.startFuel, stability: 80, oxygen: 100,
@@ -31,10 +37,18 @@ class GameScene extends Phaser.Scene {
     this.selected = null;              // {kind:'bay'|'shipCargo'|'shipLoad', key, id}
     this.containerSeq = 1;
     this.shipSeq = 1;
-    this.stats = { done: 0, unloaded: 0, missed: 0, stolen: 0 };
+    this.stats = { done: 0, unloaded: 0, missed: 0, stolen: 0, contractDone: 0, contractExpired: 0 };
     this.spawnTimer = 1.0;
     this.eventTimer = rand(this.cfg.eventInterval[0], this.cfg.eventInterval[1]);
     this.lastEvent = null;
+
+    // ---- 合同模式状态 ----
+    this.intro = false;
+    this.contractSeq = 1;
+    this.contracts = [];
+    this.market = { prices: { ...MARKET.base }, timer: MARKET.interval, last: { ...MARKET.base } };
+    this.earnings = { base: 0, market: 0, time: 0, fuel: 0 };
+    this.saveTimer = 0;
 
     this.createTextures();
     drawStars(this);
@@ -48,15 +62,40 @@ class GameScene extends Phaser.Scene {
     this.buildPauseOverlay();
     this.setupInput();
 
-    // 初始船流
-    this.enqueueShip('unloader', 0.5);
-    this.enqueueShip('loader', 1.5);
-    this.enqueueShip(null, 6);
-    this.enqueueShip(null, 11);
+    if (this.contractMode && this.resumeKey && loadContractSave(this.resumeKey)) {
+      // 恢复未结束合同局
+      this.restoreRun(loadContractSave(this.resumeKey));
+      this.resumeKey = null;
+      this.addLog('📂 已恢复上次未结束的合同局', '#9dff9d');
+    } else {
+      if (this.contractMode) {
+        // 合同接取前只安排卸货船，确保装货船在接取后生成、能匹配合同
+        this.enqueueShip('unloader', 0.5);
+        this.enqueueShip('unloader', 8);
+      } else {
+        // 初始船流
+        this.enqueueShip('unloader', 0.5);
+        this.enqueueShip('loader', 1.5);
+        this.enqueueShip(null, 6);
+        this.enqueueShip(null, 11);
+      }
+      if (this.contractMode) {
+        // 弹出 3 份合同供接取（至多 2 份）
+        this.intro = true;
+        this.showContractOffer();
+      }
+    }
 
     this.addLog('🛰 空间站调度系统上线，开始作业', '#7fe3ff');
-    this.addLog('点击货物选择，再点击舱位或船只放置', '#9fb7cc');
+    if (!this.contractMode) this.addLog('点击货物选择，再点击舱位或船只放置', '#9fb7cc');
     this.renderAll();
+
+    // 离开页面前自动保存合同局
+    if (this.contractMode) {
+      this._onHide = () => { if (!this.state.gameOver) this.saveRun(); };
+      window.addEventListener('pagehide', this._onHide);
+      this.events.once('shutdown', () => window.removeEventListener('pagehide', this._onHide));
+    }
   }
 
   createTextures() {
@@ -79,7 +118,7 @@ class GameScene extends Phaser.Scene {
   buildTopBar() {
     this.add.rectangle(0, 0, 1280, 54, 0x0b1622).setOrigin(0);
     this.add.rectangle(0, 53, 1280, 1, 0x1e3247).setOrigin(0);
-    this.add.text(16, 8, `🛰 星际运输站 · ${this.cfg.name}`, TS(18, '#dff3ff', { fontStyle: 'bold' }));
+    this.add.text(16, 8, `🛰 星际运输站 · ${this.cfg.name}${this.contractMode ? ' · 合同模式' : ''}`, TS(18, '#dff3ff', { fontStyle: 'bold' }));
     this.add.text(16, 33, `难度 ${this.cfg.stars} · 泊位 ${this.cfg.docks} · 舱位 ${this.cfg.bays}`, TS(11, '#6f8aa5'));
 
     const ui = this.ui = {};
@@ -100,7 +139,10 @@ class GameScene extends Phaser.Scene {
     ui.timeText = this.add.text(928, 20, '00:00', TS(16, '#9fb7cc'));
     ui.undoBtn  = makeButton(this, 1030, 27, 84, 26, '↩ 撤销', () => this.undo(), { fontSize: 13 });
     ui.pauseBtn = makeButton(this, 1122, 27, 76, 26, '⏸ 暂停', () => this.togglePause(), { fontSize: 13 });
-    ui.menuBtn  = makeButton(this, 1206, 27, 76, 26, '菜单', () => this.scene.start('MenuScene'), { fontSize: 13 });
+    ui.menuBtn  = makeButton(this, 1206, 27, 76, 26, '菜单', () => {
+      if (this.contractMode && !this.state.gameOver) this.saveRun();
+      this.scene.start('MenuScene');
+    }, { fontSize: 13 });
   }
 
   buildDeck() {
@@ -155,8 +197,58 @@ class GameScene extends Phaser.Scene {
   buildRightPanels() {
     const x = 984, w = 280;
     this.add.text(x, 58, '入港队列', TS(12, '#7d93a8'));
-    this.add.rectangle(x, 76, w, 168, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
-    this.queueList = this.add.container(x + 10, 88);
+    this.add.rectangle(x, 76, w, 132, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
+    this.queueList = this.add.container(x + 10, 86);
+
+    if (this.contractMode) {
+      // 合同进度
+      this.add.text(x, 216, '合同进度', TS(12, '#7d93a8'));
+      this.add.rectangle(x, 234, w, 124, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x3a4a66);
+      this.contractRows = [];
+      for (let i = 0; i < CONTRACT_MAX_ACCEPT; i++) {
+        const row = {
+          bg: this.add.rectangle(x + w / 2, 252 + i * 52, w - 10, 46, 0x14202e).setStrokeStyle(1, 0x2c4258),
+          head: this.add.text(x + 10, 240 + i * 52, '', TS(11, '#dff3ff', { fontStyle: 'bold' })),
+          prog: this.add.text(x + 10, 256 + i * 52, '', TS(10, '#9fb7cc')),
+          due:  this.add.text(x + w - 10, 240 + i * 52, '', TS(10, '#9fb7cc')).setOrigin(1, 0),
+        };
+        this.contractRows.push(row);
+      }
+
+      // 市场行情
+      this.add.text(x, 366, '市场行情', TS(12, '#7d93a8'));
+      this.add.rectangle(x, 384, w, 104, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x3a4a66);
+      this.marketRows = {};
+      CARGO_KEYS.forEach((k, i) => {
+        const ct = CARGO_TYPES[k];
+        this.add.rectangle(x + 14, 400 + i * 20, 8, 8, ct.color);
+        this.marketRows[k] = {
+          price: this.add.text(x + 26, 392 + i * 20, '', TS(11, '#cfe6f5')),
+          delta: this.add.text(x + w - 12, 392 + i * 20, '', TS(11, '#9fb7cc')).setOrigin(1, 0),
+        };
+      });
+      this.marketTimerText = this.add.text(x + 10, 466, '', TS(10, '#5d7a94'));
+
+      // 航线统计（精简）
+      this.add.text(x, 496, '航线统计', TS(12, '#7d93a8'));
+      this.add.rectangle(x, 514, w, 112, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
+      const bestC = loadBestContracts()[this.cfg.key] || 0;
+      this.statsTexts = {
+        done:     this.add.text(x + 12, 522, '', TS(11, '#9fb7cc')),
+        contract: this.add.text(x + 12, 540, '', TS(11, '#9fb7cc')),
+        missed:   this.add.text(x + 12, 558, '', TS(11, '#9fb7cc')),
+        stolen:   this.add.text(x + 12, 576, '', TS(11, '#9fb7cc')),
+        time:     this.add.text(x + 12, 594, '', TS(11, '#9fb7cc')),
+        best:     this.add.text(x + 12, 612, `最佳合同收益：${bestC}`, TS(11, '#ffd24a')),
+      };
+
+      // 操作提示（精简）
+      this.add.rectangle(x, 636, w, 56, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
+      this.add.text(x + 10, 644,
+        '按合同目的地装货可结算倍率与行情收益\n价格每 60 秒波动 · 空格暂停 · Z 撤销 · M 静音',
+        TS(10, '#7d93a8', { lineSpacing: 6 }));
+      return;
+    }
 
     this.add.text(x, 260, '航线统计', TS(12, '#7d93a8'));
     this.add.rectangle(x, 280, w, 144, 0x0d1622).setOrigin(0).setStrokeStyle(1, 0x22364a);
@@ -232,6 +324,7 @@ class GameScene extends Phaser.Scene {
 
   update(time, delta) {
     const dt = Math.min(delta / 1000, 0.1);
+    if (this.contractMode && this.intro) { this.refreshFrame(); return; }
     if (!this.state.paused && !this.state.gameOver) this.tick(dt);
     this.refreshFrame();
   }
@@ -281,7 +374,15 @@ class GameScene extends Phaser.Scene {
     if (st.fuel < 1) ds -= 1.5;
     if (st.oxygen <= 0) ds -= 3;
     st.stability = clamp(st.stability + ds * dt, 0, 100);
-    if (st.stability <= 0) this.gameOver('稳定度归零，空间站陷入混乱！');
+    if (st.stability <= 0) { this.gameOver('稳定度归零，空间站陷入混乱！'); return; }
+
+    if (this.contractMode) {
+      this.tickContracts(dt);
+      if (!st.gameOver) {
+        this.saveTimer += dt;
+        if (this.saveTimer >= 4) { this.saveTimer = 0; this.saveRun(); }
+      }
+    }
   }
 
   refreshFrame() {
@@ -336,11 +437,59 @@ class GameScene extends Phaser.Scene {
     if (!st.crisis && this.bannerEventText) setTxt(this.bannerEventText, `下一事件：约 ${Math.ceil(this.eventTimer)}s 后`);
 
     // 统计
-    setTxt(this.statsTexts.done, `完成订单：${this.stats.done}`);
-    setTxt(this.statsTexts.unloaded, `卸货完成：${this.stats.unloaded}`);
-    setTxt(this.statsTexts.missed, `错失船只：${this.stats.missed}`);
-    setTxt(this.statsTexts.stolen, `被掠货物：${this.stats.stolen}`);
-    setTxt(this.statsTexts.time, `存活时间：${fmtTime(st.time)}`);
+    if (this.contractMode) {
+      setTxt(this.statsTexts.done, `装货订单：${this.stats.done} · 卸货：${this.stats.unloaded}`);
+      setTxt(this.statsTexts.contract, `合同 完成${this.stats.contractDone} / 逾期${this.stats.contractExpired}`);
+      setTxt(this.statsTexts.missed, `错失船只：${this.stats.missed} · 被掠：${this.stats.stolen}`);
+      setTxt(this.statsTexts.stolen, `合同结算：${this.earnings.base + this.earnings.market + this.earnings.time}`);
+      setTxt(this.statsTexts.time, `计时：${fmtTime(st.time)}`);
+      this.refreshContractPanel();
+      this.refreshMarketPanel();
+    } else {
+      setTxt(this.statsTexts.done, `完成订单：${this.stats.done}`);
+      setTxt(this.statsTexts.unloaded, `卸货完成：${this.stats.unloaded}`);
+      setTxt(this.statsTexts.missed, `错失船只：${this.stats.missed}`);
+      setTxt(this.statsTexts.stolen, `被掠货物：${this.stats.stolen}`);
+      setTxt(this.statsTexts.time, `存活时间：${fmtTime(st.time)}`);
+    }
+  }
+
+  refreshContractPanel() {
+    if (!this.contractRows) return;
+    const active = this.contracts.filter(c => c.status === 'active');
+    this.contractRows.forEach((row, i) => {
+      const c = active[i];
+      if (!c) {
+        row.bg.setVisible(false).setStrokeStyle(1, 0x2c4258);
+        [row.head, row.prog, row.due].forEach(t => setTxt(t, ''));
+        return;
+      }
+      row.bg.setVisible(true);
+      const left = c.deadline - this.state.time;
+      const overdueSoon = left <= 15;
+      const color = overdueSoon ? '#ff8a80' : '#dff3ff';
+      const progStr = CARGO_KEYS.filter(k => c.req[k] > 0)
+        .map(k => `${CARGO_TYPES[k].short}${Math.min(c.done[k], c.req[k])}/${c.req[k]}`).join(' ');
+      setTxt(row.head, `[${c.id}] ${truncate(c.dest, 7)} ×${c.mult.toFixed(1)}`);
+      row.head.setColor(color);
+      setTxt(row.prog, `${comboText(c.req)}  ${progStr}`);
+      setTxt(row.due, left > 0 ? `⏱ ${Math.ceil(left)}s` : '逾期!');
+      row.due.setColor(overdueSoon ? '#ff8a80' : '#9fb7cc');
+      row.bg.setStrokeStyle(1, overdueSoon ? 0xff5252 : 0x3a4a66);
+    });
+  }
+
+  refreshMarketPanel() {
+    if (!this.marketRows) return;
+    CARGO_KEYS.forEach(k => {
+      const p = this.market.prices[k], base = MARKET.base[k], prev = this.market.last[k];
+      setTxt(this.marketRows[k].price, `${CARGO_TYPES[k].name}  ${p}`);
+      const pct = Math.round((p / base - 1) * 100);
+      const tick = p > prev ? '▲' : p < prev ? '▼' : '·';
+      setTxt(this.marketRows[k].delta, `${tick}${pct > 0 ? '+' : ''}${pct}%`);
+      this.marketRows[k].delta.setColor(p > prev ? '#9dff9d' : p < prev ? '#ff8a80' : '#9fb7cc');
+    });
+    setTxt(this.marketTimerText, `下次波动：${Math.ceil(this.market.timer)}s · 基础 ${MARKET.base.ore}/${MARKET.base.energy}/${MARKET.base.supply}`);
   }
 
   /* ================= 渲染 ================= */
@@ -405,8 +554,9 @@ class GameScene extends Phaser.Scene {
     v.empty.setVisible(false);
     v.icon.setVisible(true).setTexture(ship.kind === 'unloader' ? 'ship_in' : 'ship_out');
     setTxt(v.nameT, truncate(ship.name, 15)); v.nameT.setColor('#dff3ff');
-    setTxt(v.kindT, ship.kind === 'unloader' ? '▼ 卸货船' : '▲ 装货船');
-    v.kindT.setColor(ship.kind === 'unloader' ? '#4fc3f7' : '#ffb74d');
+    setTxt(v.kindT, ship.kind === 'unloader' ? '▼ 卸货船'
+      : ('▲ 装货船' + (this.contractMode && ship.contractId != null ? ' · 📜合同' : '')));
+    v.kindT.setColor(ship.kind === 'unloader' ? '#4fc3f7' : (ship.contractId != null ? '#c79fff' : '#ffb74d'));
     v.departBtn.setVisible(true);
     v.bg.setStrokeStyle(1, ship.kind === 'unloader' ? 0x2a6a8a : 0x8a6a2a);
 
@@ -602,7 +752,7 @@ class GameScene extends Phaser.Scene {
   /* ================= 玩家操作 ================= */
 
   onBayClicked(i) {
-    if (this.state.gameOver) return;
+    if (this.state.gameOver || this.intro) return;
     const sel = this.selected;
     if (!sel) return;
     if (sel.kind === 'bay' && sel.key === i) { this.clearSelection(); return; }
@@ -628,7 +778,7 @@ class GameScene extends Phaser.Scene {
   }
 
   onContainerClicked(kind, key, id) {
-    if (this.state.gameOver) return;
+    if (this.state.gameOver || this.intro) return;
     const sel = this.selected;
     if (sel && sel.kind === kind && sel.key === key && sel.id === id) { this.clearSelection(); return; }
     // 合并：已选中舱内货物，点击同类舱内货物
@@ -646,7 +796,7 @@ class GameScene extends Phaser.Scene {
   }
 
   onDockPanelClicked(i) {
-    if (this.state.gameOver) return;
+    if (this.state.gameOver || this.intro) return;
     const ship = this.state.docks[i];
     if (!ship) return;
     if (ship.kind !== 'loader') {
@@ -781,7 +931,7 @@ class GameScene extends Phaser.Scene {
   }
 
   undo() {
-    if (this.state.gameOver) return;
+    if (this.state.gameOver || this.intro) return;
     const s = this.undoStack.pop();
     if (!s) { this.addLog('没有可撤销的操作', '#4a6076'); return; }
     this.applySnapshot(s);
@@ -824,13 +974,31 @@ class GameScene extends Phaser.Scene {
       cargo: [], loadedContainers: [],
       loaded: { ore: 0, energy: 0, supply: 0 },
       requires: null, eta: 0,
+      dest: null, contractId: null,
     };
     if (kind === 'unloader') {
       ship.name = pick(SHIP_NAMES);
       const n = randInt(cfg.unloadCount[0], cfg.unloadCount[1]);
       for (let i = 0; i < n; i++) ship.cargo.push(this.makeContainer());
+    } else if (this.contractMode && !this.intro) {
+      // 合同模式：70% 概率发往在执行合同的目的地，订单直接对应合同货物组合
+      const active = this.contracts.filter(c => c.status === 'active' && c.deadline > this.state.time);
+      let ctr = null;
+      if (active.length && Math.random() < 0.7) ctr = pick(active);
+      const baseName = pick(SHIP_NAMES);
+      if (ctr) {
+        ship.dest = ctr.dest;
+        ship.contractId = ctr.id;
+        ship.requires = { ...ctr.req };
+        ship.name = `${baseName} → ${ctr.dest}`;
+      } else {
+        ship.dest = pick(DESTINATIONS);
+        ship.requires = this.genRequirements();
+        ship.name = `${baseName} → ${ship.dest}`;
+      }
     } else {
-      ship.name = pick(SHIP_NAMES) + ' → ' + pick(DESTINATIONS);
+      ship.dest = pick(DESTINATIONS);
+      ship.name = pick(SHIP_NAMES) + ' → ' + ship.dest;
       ship.requires = this.genRequirements();
     }
     ship.totalTime = ship.timeLeft = rand(cfg.shipTime[0], cfg.shipTime[1]);
@@ -891,6 +1059,8 @@ class GameScene extends Phaser.Scene {
         Sfx.error();
         this.cameras.main.shake(150, 0.004);
       }
+    } else if (this.contractMode) {
+      this.settleLoaderContract(ship, fx, fy);
     } else {
       let reqTotal = 0, fulfilled = 0, value = 0;
       CARGO_KEYS.forEach(k => {
@@ -1036,7 +1206,7 @@ class GameScene extends Phaser.Scene {
   deckLoadRatio() { return this.totalDeckWeight() / (this.state.bays.length * BAY_MAX_WEIGHT); }
 
   togglePause() {
-    if (this.state.gameOver) return;
+    if (this.state.gameOver || this.intro) return;
     this.state.paused = !this.state.paused;
     this.pauseOverlay.setVisible(this.state.paused);
     this.ui.pauseBtn.setLabel(this.state.paused ? '▶ 继续' : '⏸ 暂停');
@@ -1049,10 +1219,22 @@ class GameScene extends Phaser.Scene {
     st.gameOver = true;
     Sfx.alarm();
 
-    const best = loadBest();
-    const prev = best[this.cfg.key] || 0;
-    const isRec = st.score > prev;
-    if (isRec) { best[this.cfg.key] = st.score; saveBest(best); }
+    let prev, isRec;
+    if (this.contractMode) {
+      clearContractRun(this.cfg.key);
+      const best = loadBestContracts();
+      prev = best[this.cfg.key] || 0;
+      isRec = this.earnings.base + this.earnings.market + this.earnings.time > prev;
+      if (isRec) {
+        best[this.cfg.key] = this.earnings.base + this.earnings.market + this.earnings.time;
+        saveBestContracts(best);
+      }
+    } else {
+      const best = loadBest();
+      prev = best[this.cfg.key] || 0;
+      isRec = st.score > prev;
+      if (isRec) { best[this.cfg.key] = st.score; saveBest(best); }
+    }
 
     const ov = this.add.container(0, 0).setDepth(100);
     const dim = this.add.rectangle(0, 0, 1280, 720, 0x000000, 0.72).setOrigin(0).setInteractive();
@@ -1061,17 +1243,374 @@ class GameScene extends Phaser.Scene {
     ov.add(this.add.text(640, 168, '航 线 终 止', TS(36, '#ff8a80', { fontStyle: 'bold' })).setOrigin(0.5));
     ov.add(this.add.text(640, 212, reason, TS(14, '#ffb0a8')).setOrigin(0.5));
     if (isRec) ov.add(this.add.text(640, 244, '🏆 新纪录！', TS(20, '#ffd24a', { fontStyle: 'bold' })).setOrigin(0.5));
-    const lines = [
-      `最终得分：${st.score}`,
-      `历史最高：${Math.max(prev, st.score)}`,
-      `完成订单：${this.stats.done}`,
-      `卸货完成：${this.stats.unloaded}`,
-      `错失船只：${this.stats.missed}`,
-      `被掠货物：${this.stats.stolen}`,
-      `存活时间：${fmtTime(st.time)}`,
-    ].join('\n');
-    ov.add(this.add.text(640, isRec ? 336 : 324, lines, TS(16, '#cfe6f5', { align: 'center', lineSpacing: 10 })).setOrigin(0.5));
-    ov.add(makeButton(this, 550, 520, 150, 40, '🔁 再来一局', () => this.scene.restart({ difficulty: this.diffIndex }), { fontSize: 15 }));
+    let lines;
+    if (this.contractMode) {
+      const tot = this.earnings.base + this.earnings.market + this.earnings.time;
+      lines = [
+        `最终得分：${st.score}`,
+        `合同结算合计：${tot}`,
+        `合同 完成 ${this.stats.contractDone} / 逾期 ${this.stats.contractExpired}`,
+        `装货订单：${this.stats.done} · 卸货：${this.stats.unloaded}`,
+        `错失船只：${this.stats.missed} · 被掠：${this.stats.stolen}`,
+        `存活时间：${fmtTime(st.time)}`,
+        `最佳合同收益：${Math.max(prev, tot)}`,
+      ].join('\n');
+    } else {
+      lines = [
+        `最终得分：${st.score}`,
+        `历史最高：${Math.max(prev, st.score)}`,
+        `完成订单：${this.stats.done}`,
+        `卸货完成：${this.stats.unloaded}`,
+        `错失船只：${this.stats.missed}`,
+        `被掠货物：${this.stats.stolen}`,
+        `存活时间：${fmtTime(st.time)}`,
+      ].join('\n');
+    }
+    ov.add(this.add.text(640, isRec ? 340 : 328, lines, TS(15, '#cfe6f5', { align: 'center', lineSpacing: 9 })).setOrigin(0.5));
+    ov.add(makeButton(this, 550, 520, 150, 40, '🔁 再来一局',
+      () => this.scene.restart(this.contractMode ? { difficulty: this.diffIndex, mode: 'contract', fresh: true } : { difficulty: this.diffIndex }),
+      { fontSize: 15 }));
     ov.add(makeButton(this, 730, 520, 150, 40, '返回菜单', () => this.scene.start('MenuScene'), { fontSize: 15 }));
+  }
+
+  /* ================= 合同模式：合同生成与接取 ================= */
+
+  generateContracts() {
+    const cc = CONTRACT_CFG[this.cfg.key];
+    const dests = Phaser.Utils.Array.Shuffle([...DESTINATIONS]).slice(0, 3);
+    return dests.map(dest => {
+      const req = genCargoCombo(cc.units, cc.types);
+      const total = CARGO_KEYS.reduce((s, k) => s + req[k], 0);
+      const deadline = Math.round(this.state.time + rand(cc.deadline[0], cc.deadline[1]));
+      const mult = Math.round(rand(cc.mult[0] * 10, cc.mult[1] * 10)) / 10;
+      return {
+        id: this.contractSeq++,
+        dest, req, total,
+        deadline, mult,
+        status: 'offered',                       // offered | active | done | expired
+        done: { ore: 0, energy: 0, supply: 0 },
+        baseEarn: 0, marketEarn: 0, timeEarn: 0,
+      };
+    });
+  }
+
+  showContractOffer() {
+    const offers = this.generateContracts();
+    this.contracts = offers;
+    const selected = new Set();
+
+    const ov = this.add.container(0, 0).setDepth(90);
+    const dim = this.add.rectangle(0, 0, 1280, 720, 0x000000, 0.78).setOrigin(0).setInteractive();
+    const panel = this.add.rectangle(640, 330, 1080, 560, 0x101c2b).setStrokeStyle(2, 0x7fe3ff);
+    ov.add([dim, panel]);
+    ov.add(this.add.text(640, 74, '📜 航 线 合 同', TS(30, '#7fe3ff', { fontStyle: 'bold' })).setOrigin(0.5));
+    ov.add(this.add.text(640, 112, `本航次公开 3 份合同，请接取 1～${CONTRACT_MAX_ACCEPT} 份（点击卡片选择 / 取消）`, TS(14, '#9fb7cc')).setOrigin(0.5));
+
+    const cw = 320, ch = 360, gap = 30;
+    const x0 = 640 - (3 * cw + 2 * gap) / 2;
+    const cards = offers.map((c, i) => {
+      const cx = x0 + i * (cw + gap) + cw / 2, cy = 330;
+      const card = this.add.container(cx, cy);
+      const bg = this.add.rectangle(0, 0, cw, ch, 0x14202e).setStrokeStyle(2, 0x2c4258);
+      const lines = [
+        `目的地：${c.dest}`,
+        `货物：${comboText(c.req)}（共 ${c.total} 件）`,
+        `截止：${fmtTime(c.deadline)} 前完成`,
+        `奖励倍率：×${c.mult.toFixed(1)}`,
+        `基准货值：${contractBaseValue(c.req)}`,
+      ].join('\n');
+      const t = this.add.text(0, -70, lines, TS(14, '#dff3ff', { align: 'center', lineSpacing: 14 })).setOrigin(0.5);
+      const mark = this.add.text(0, ch / 2 - 40, '', TS(16, '#9dff9d', { fontStyle: 'bold' })).setOrigin(0.5);
+      card.add([bg, t, mark]);
+      ov.add(card);
+      bg.setInteractive({ useHandCursor: true });
+      bg.on('pointerdown', () => {
+        Sfx.click();
+        if (selected.has(i)) { selected.delete(i); }
+        else {
+          if (selected.size >= CONTRACT_MAX_ACCEPT) { this.addLog(`最多同时接取 ${CONTRACT_MAX_ACCEPT} 份合同`, '#ff8a80'); Sfx.error(); return; }
+          selected.add(i);
+        }
+        refreshCards();
+      });
+      return { bg, mark };
+    });
+
+    const tip = this.add.text(640, 500, '', TS(13, '#ffd24a')).setOrigin(0.5);
+    const startBtn = makeButton(this, 640, 560, 220, 42, '接取所选并开工', () => {
+      if (!selected.size) { Sfx.error(); return; }
+      offers.forEach((c, i) => { c.status = selected.has(i) ? 'active' : 'skipped'; });
+      this.contracts = offers.filter(c => c.status === 'active');
+      ov.destroy();
+      this.intro = false;
+      this.addLog(`📜 已接取 ${this.contracts.length} 份合同，按目的地与货物组合安排装货`, '#c79fff');
+      this.addLog('行情每 60 秒波动一次，高价时交货收益更丰', '#9fb7cc');
+      Sfx.success();
+      this.renderAll();
+      this.saveRun();
+    }, { fontSize: 15, bg: 0x1b3a52, hover: 0x274d6e, stroke: 0x7fe3ff });
+    ov.add([startBtn, tip]);
+
+    const refreshCards = () => {
+      cards.forEach((card, i) => {
+        const on = selected.has(i);
+        card.bg.setFillStyle(on ? 0x1d3326 : 0x14202e).setStrokeStyle(2, on ? 0x7dd87d : 0x2c4258);
+        card.mark.setText(on ? '✔ 已选择' : '');
+      });
+      tip.setText(selected.size ? `已选择 ${selected.size} 份合同（最多 ${CONTRACT_MAX_ACCEPT} 份）` : '请至少选择 1 份合同');
+    };
+    refreshCards();
+  }
+
+  /* ================= 合同模式：市场与合同计时 ================= */
+
+  tickContracts(dt) {
+    // 行情波动
+    this.market.timer -= dt;
+    if (this.market.timer <= 0) {
+      this.market.timer = MARKET.interval;
+      this.fluctuateMarket();
+    }
+    // 合同逾期
+    let changed = false;
+    this.contracts.forEach(c => {
+      if (c.status === 'active' && this.state.time >= c.deadline) {
+        c.status = 'expired';
+        changed = true;
+        this.stats.contractExpired++;
+        const pen = CONTRACT_CFG[this.cfg.key].penalty;
+        this.state.stability = Math.max(0, this.state.stability - pen);
+        this.addLog(`⏰ 合同 [${c.id}] 前往${c.dest}逾期！稳定度 -${pen}`, '#ff8a80');
+        Sfx.error();
+        this.cameras.main.shake(150, 0.004);
+        this.renderBanner();
+      }
+    });
+    if (changed) {
+      this.renderAll();
+      this.saveRun();
+      if (this.state.stability <= 0) { this.gameOver('稳定度归零，空间站陷入混乱！'); return; }
+      this.checkAllContractsResolved();
+    }
+  }
+
+  fluctuateMarket() {
+    this.market.last = { ...this.market.prices };
+    CARGO_KEYS.forEach(k => {
+      const f = 1 + rand(-MARKET.swing, MARKET.swing);
+      const p = Math.round(clamp(this.market.prices[k] * f, MARKET.min[k], MARKET.max[k]));
+      this.market.prices[k] = p;
+    });
+    const parts = CARGO_KEYS.map(k => `${CARGO_TYPES[k].short}${this.market.prices[k]}`);
+    this.addLog(`📈 市场行情波动：${parts.join(' / ')}`, '#7fe3ff');
+    Sfx.click();
+  }
+
+  /* ================= 合同模式：订单结算 ================= */
+
+  settleLoaderContract(ship, fx, fy) {
+    const st = this.state;
+    let reqTotal = 0, fulfilled = 0;
+    CARGO_KEYS.forEach(k => {
+      const req = ship.requires[k] || 0;
+      reqTotal += req;
+      fulfilled += Math.min(ship.loaded[k], req);
+    });
+
+    if (fulfilled < reqTotal || reqTotal === 0) {
+      // 订单未完成：同经典规则扣稳定度，不结算合同
+      if (fulfilled > 0) {
+        st.stability = Math.max(0, st.stability - 5);
+        this.stats.missed++;
+        this.addLog(`⚠ 前往${ship.dest || '未知'}订单未完成（${fulfilled}/${reqTotal}）离港，稳定度 -5`, '#ffb74d');
+      } else {
+        st.stability = Math.max(0, st.stability - 8);
+        this.stats.missed++;
+        this.addLog(`❌ ${truncate(ship.name, 12)} 空船离港！稳定度 -8`, '#ff8a80');
+        this.cameras.main.shake(150, 0.004);
+      }
+      Sfx.error();
+      return;
+    }
+
+    // 按当前行情计算货物收益
+    let baseAtBase = 0, atMarket = 0;
+    CARGO_KEYS.forEach(k => {
+      const n = Math.min(ship.loaded[k], ship.requires[k] || 0);
+      baseAtBase += n * MARKET.base[k];
+      atMarket += n * this.market.prices[k];
+    });
+
+    let ctr = null;
+    if (ship.contractId != null) ctr = this.contracts.find(c => c.id === ship.contractId && c.status === 'active');
+    // 目的地匹配的在执行合同同样可结算（即使该船不是为合同生成的）
+    if (!ctr && ship.dest) ctr = this.contracts.find(c => c.status === 'active' && c.dest === ship.dest);
+
+    const mult = ctr ? ctr.mult : 1;
+    const marketBonus = Math.round((atMarket - baseAtBase) * mult);
+    const baseEarn = Math.round(baseAtBase * mult);
+    const timeBonus = Math.max(0, Math.ceil(ship.timeLeft));
+    const gain = baseEarn + marketBonus + timeBonus;
+
+    st.score += gain;
+    st.fuel = Math.min(FUEL_MAX, st.fuel + 8);
+    st.stability = Math.min(100, st.stability + 4);
+    this.stats.done++;
+    this.earnings.base += baseEarn;
+    this.earnings.market += marketBonus;
+    this.earnings.time += timeBonus;
+    this.earnings.fuel += 8;
+
+    if (ctr) {
+      CARGO_KEYS.forEach(k => { ctr.done[k] += Math.min(ship.loaded[k], ship.requires[k] || 0); });
+      ctr.baseEarn += baseEarn; ctr.marketEarn += marketBonus; ctr.timeEarn += timeBonus;
+      this.addLog(
+        `✅ 合同[${ctr.id}] ${ship.dest} 交货 +${gain}（基础${baseEarn} 行情${marketBonus >= 0 ? '+' : ''}${marketBonus} 时间+${timeBonus}）+8燃料`,
+        '#9dff9d');
+      this.floatText(fx, fy, '+' + gain, '#c79fff');
+      const complete = CARGO_KEYS.every(k => ctr.done[k] >= ctr.req[k]);
+      if (complete) {
+        ctr.status = 'done';
+        this.stats.contractDone++;
+        this.addLog(`🏁 合同 [${ctr.id}] 前往${ctr.dest}已全部完成！`, '#ffd24a');
+      }
+    } else {
+      this.addLog(
+        `✅ 前往${ship.dest || '未知'}散单 +${gain}（基础${baseEarn} 行情${marketBonus >= 0 ? '+' : ''}${marketBonus} 时间+${timeBonus}）+8燃料`,
+        '#9dff9d');
+      this.floatText(fx, fy, '+' + gain, '#ffd24a');
+    }
+    Sfx.success();
+    this.saveRun();
+    if (ctr) this.checkAllContractsResolved();
+  }
+
+  checkAllContractsResolved() {
+    if (this.state.gameOver) return;
+    const pending = this.contracts.filter(c => c.status === 'active').length;
+    if (pending > 0) return;
+    // 全部合同已结束（完成或逾期）→ 结算界面
+    this.state.gameOver = true;
+    this.showContractSettlement();
+  }
+
+  showContractSettlement() {
+    const st = this.state;
+    clearContractRun(this.cfg.key);
+    const total = this.earnings.base + this.earnings.market + this.earnings.time;
+    const best = loadBestContracts();
+    const prev = best[this.cfg.key] || 0;
+    const isRec = total > prev;
+    if (isRec) { best[this.cfg.key] = total; saveBestContracts(best); }
+
+    const ov = this.add.container(0, 0).setDepth(100);
+    const dim = this.add.rectangle(0, 0, 1280, 720, 0x000000, 0.75).setOrigin(0).setInteractive();
+    const panel = this.add.rectangle(640, 360, 600, 540, 0x101c2b).setStrokeStyle(2, 0x7dd87d);
+    ov.add([dim, panel]);
+    ov.add(this.add.text(640, 120, '📜 合 同 结 算', TS(34, '#7fe3ff', { fontStyle: 'bold' })).setOrigin(0.5));
+    ov.add(this.add.text(640, 160, `${this.cfg.name} · 全部合同已结束`, TS(14, '#9fb7cc')).setOrigin(0.5));
+    if (isRec) ov.add(this.add.text(640, 188, '🏆 最佳合同收益新纪录！', TS(18, '#ffd24a', { fontStyle: 'bold' })).setOrigin(0.5));
+
+    // 每份合同明细
+    const detail = this.contracts.map(c => {
+      const sum = c.baseEarn + c.marketEarn + c.timeEarn;
+      const tag = c.status === 'done' ? '✔完成' : '⏰逾期';
+      return `[${c.id}] ${truncate(c.dest, 7)} ×${c.mult.toFixed(1)} ${tag}  收益 ${sum}`;
+    }).join('\n');
+    ov.add(this.add.text(640, 250, detail, TS(13, '#cfe6f5', { align: 'center', lineSpacing: 10 })).setOrigin(0.5));
+
+    const lines = [
+      `基础收益（含倍率）：${this.earnings.base}`,
+      `行情加成：${this.earnings.market >= 0 ? '+' : ''}${this.earnings.market}`,
+      `时间奖励：${this.earnings.time}`,
+      `合同结算合计：${total}`,
+      `其他得分（卸货等）：${Math.max(0, st.score - total)}`,
+      `最终总分：${st.score}`,
+      `完成 ${this.stats.contractDone} 份 · 逾期 ${this.stats.contractExpired} 份 · 用时 ${fmtTime(st.time)}`,
+      `历史最佳合同收益：${Math.max(prev, total)}`,
+    ].join('\n');
+    ov.add(this.add.text(640, 410, lines, TS(15, '#dff3ff', { align: 'center', lineSpacing: 10 })).setOrigin(0.5));
+    ov.add(makeButton(this, 540, 580, 180, 42, '🔁 再来一局',
+      () => this.scene.restart({ difficulty: this.diffIndex, mode: 'contract', fresh: true }), { fontSize: 15 }));
+    ov.add(makeButton(this, 740, 580, 180, 42, '返回菜单', () => this.scene.start('MenuScene'), { fontSize: 15 }));
+    Sfx.success();
+  }
+
+  /* ================= 合同模式：存档 / 续局 ================= */
+
+  serializeShip(sh) {
+    return {
+      id: sh.id, kind: sh.kind, name: sh.name,
+      cargo: sh.cargo.map(c => ({ ...c })),
+      loadedContainers: sh.loadedContainers.map(c => ({ ...c })),
+      loaded: { ...sh.loaded }, requires: sh.requires ? { ...sh.requires } : null,
+      eta: sh.eta, timeLeft: sh.timeLeft, totalTime: sh.totalTime,
+      dest: sh.dest || null, contractId: sh.contractId != null ? sh.contractId : null,
+    };
+  }
+
+  saveRun() {
+    if (!this.contractMode || this.intro) return;
+    const st = this.state;
+    if (st.gameOver) { clearContractRun(this.cfg.key); return; }
+    try {
+      const data = {
+        v: 1, diffIndex: this.diffIndex, savedAt: Date.now(),
+        state: {
+          time: st.time, score: st.score, fuel: st.fuel, stability: st.stability, oxygen: st.oxygen,
+          leak: st.leak,
+          bays: st.bays.map(b => ({ containers: b.containers.map(c => ({ ...c })), damagedUntil: b.damagedUntil })),
+          docks: st.docks.map(sh => sh ? this.serializeShip(sh) : null),
+          queue: st.queue.map(sh => this.serializeShip(sh)),
+        },
+        seqs: { container: this.containerSeq, ship: this.shipSeq, contract: this.contractSeq },
+        contracts: this.contracts.map(c => ({ ...c, req: { ...c.req }, done: { ...c.done } })),
+        market: { prices: { ...this.market.prices }, last: { ...this.market.last }, timer: this.market.timer },
+        earnings: { ...this.earnings },
+        stats: { ...this.stats },
+        timers: { spawn: this.spawnTimer, event: this.eventTimer, save: this.saveTimer },
+        lastEvent: this.lastEvent,
+        crisis: st.crisis ? { ...st.crisis } : null,
+      };
+      saveContractRun(this.cfg.key, data);
+    } catch (e) { /* ignore */ }
+  }
+
+  restoreShip(d) {
+    return {
+      id: d.id, kind: d.kind, name: d.name,
+      cargo: d.cargo.map(c => ({ ...c })),
+      loadedContainers: d.loadedContainers.map(c => ({ ...c })),
+      loaded: { ...d.loaded }, requires: d.requires ? { ...d.requires } : null,
+      eta: d.eta, timeLeft: d.timeLeft, totalTime: d.totalTime,
+      dest: d.dest || null, contractId: d.contractId != null ? d.contractId : null,
+    };
+  }
+
+  restoreRun(data) {
+    const st = this.state, s = data.state;
+    st.time = s.time; st.score = s.score; st.fuel = s.fuel;
+    st.stability = s.stability; st.oxygen = s.oxygen; st.leak = s.leak;
+    st.bays = s.bays.map(b => ({ containers: b.containers.map(c => ({ ...c })), damagedUntil: b.damagedUntil }));
+    st.docks = s.docks.map(d => d ? this.restoreShip(d) : null);
+    st.queue = s.queue.map(d => this.restoreShip(d));
+    st.crisis = data.crisis || null;
+
+    this.containerSeq = data.seqs.container;
+    this.shipSeq = data.seqs.ship;
+    this.contractSeq = data.seqs.contract;
+    this.contracts = data.contracts.map(c => ({ ...c, req: { ...c.req }, done: { ...c.done } }));
+    this.market = { prices: { ...data.market.prices }, last: { ...data.market.last }, timer: data.market.timer };
+    this.earnings = { ...data.earnings };
+    this.stats = Object.assign({ done: 0, unloaded: 0, missed: 0, stolen: 0, contractDone: 0, contractExpired: 0 }, data.stats);
+    this.spawnTimer = data.timers.spawn;
+    this.eventTimer = data.timers.event;
+    this.saveTimer = data.timers.save || 0;
+    this.lastEvent = data.lastEvent || null;
+    if (data.crisis) {
+      st.crisis = { ...data.crisis };
+      if (st.crisis.type === 'pirate' && st.crisis.timeLeft == null) st.crisis.timeLeft = 9;
+    } else if (st.leak) st.crisis = { type: 'leak' };
+    this.intro = false;
   }
 }

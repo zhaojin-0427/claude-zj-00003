@@ -38,6 +38,67 @@ function saveBest(b) {
   try { localStorage.setItem(LS_BEST, JSON.stringify(b)); } catch (e) { /* 隐私模式下静默失败 */ }
 }
 
+// 合同模式：各航线最佳合同收益
+function loadBestContracts() {
+  try { return JSON.parse(localStorage.getItem(LS_BEST_CONTRACT)) || {}; } catch (e) { return {}; }
+}
+function saveBestContracts(b) {
+  try { localStorage.setItem(LS_BEST_CONTRACT, JSON.stringify(b)); } catch (e) { /* ignore */ }
+}
+
+// 合同模式：最近一次未结束进度（按航线 key 存储）
+function loadContractSaves() {
+  try { return JSON.parse(localStorage.getItem(LS_CONTRACT_SAVE)) || {}; } catch (e) { return {}; }
+}
+function loadContractSave(key) {
+  const all = loadContractSaves();
+  return all[key] || null;
+}
+function saveContractRun(key, data) {
+  try {
+    const all = loadContractSaves();
+    if (data) all[key] = data; else delete all[key];
+    localStorage.setItem(LS_CONTRACT_SAVE, JSON.stringify(all));
+  } catch (e) { /* ignore */ }
+}
+function clearContractRun(key) {
+  try {
+    const all = loadContractSaves();
+    delete all[key];
+    localStorage.setItem(LS_CONTRACT_SAVE, JSON.stringify(all));
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------- 合同与市场工具 ---------- */
+
+// 合同货物组合描述：矿×2 能×1
+function comboText(req) {
+  return CARGO_KEYS.filter(k => req[k] > 0)
+    .map(k => CARGO_TYPES[k].short + '×' + req[k]).join(' ');
+}
+
+// 一份合同完成后的基础货物价值（按基准价）
+function contractBaseValue(req) {
+  return CARGO_KEYS.reduce((s, k) => s + req[k] * MARKET.base[k], 0);
+}
+
+// 生成指定总件数/种类数的货物组合（结构同 genRequirements）
+function genCargoCombo(unitsRange, typesRange) {
+  const total = randInt(unitsRange[0], unitsRange[1]);
+  const nT = Math.min(3, randInt(typesRange[0], typesRange[1]));
+  const keys = Phaser.Utils.Array.Shuffle([...CARGO_KEYS]).slice(0, nT);
+  const req = { ore: 0, energy: 0, supply: 0 };
+  let left = total;
+  keys.forEach((k, i) => {
+    const slotsLeft = keys.length - i - 1;
+    const maxV = Math.min(3, left - slotsLeft);
+    const v = (i === keys.length - 1) ? left : randInt(1, Math.max(1, maxV));
+    req[k] = v;
+    left -= v;
+  });
+  return req;
+}
+
 /* ---------- Phaser 通用构件 ---------- */
 
 // 星空背景

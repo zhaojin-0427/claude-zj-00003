@@ -70,6 +70,26 @@ const DESTINATIONS = ['火星殖民地', '木卫二前哨', '泰坦矿场', '比
 // localStorage 键
 const LS_BEST = 'sts_best_v1';
 const LS_MUTE = 'sts_muted_v1';
+const LS_BEST_CONTRACT   = 'sts_best_contract_v1';   // 各航线最佳合同收益
+const LS_CONTRACT_SAVE   = 'sts_save_contract_v1';  // 各航线最近一次未结束合同局
+
+/* ---------- 合同模式：动态市场 ---------- */
+// 基础价与 CARGO_TYPES.value 一致；价格每 60 秒在区间内随机波动
+const MARKET = {
+  interval: 60,
+  swing: 0.25,                                  // 单次波动幅度 ±25%
+  base: { ore: 30, energy: 20, supply: 10 },
+  min:  { ore: 14, energy: 9,  supply: 5 },
+  max:  { ore: 56, energy: 38, supply: 22 },
+};
+
+/* ---------- 合同模式：合同参数（按航线递进） ---------- */
+const CONTRACT_MAX_ACCEPT = 2;
+const CONTRACT_CFG = {
+  centauri: { units: [4, 6],   types: [1, 2], deadline: [150, 180], mult: [1.2, 1.5], penalty: 10 },
+  sirius:   { units: [6, 9],   types: [2, 2], deadline: [120, 150], mult: [1.4, 1.7], penalty: 12 },
+  core:     { units: [8, 11],  types: [2, 3], deadline: [95, 120],  mult: [1.6, 2.0], penalty: 15 },
+};
 
 // 全局字体（中文）
 const FONT_FAMILY = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif';
